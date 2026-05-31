@@ -1,11 +1,11 @@
 streamlit>=1.35.0
-psxdata>=0.1.0
+psxdata==0.1.0a3
 pandas>=2.0.0
 numpy>=1.26.0
 plotly>=5.20.0
 scikit-learn>=1.4.0
 matplotlib>=3.8.0
-
-# Optional — enables Prophet time-series forecasting model
-# Requires a C++ compiler on the system (Xcode CLT on macOS)
+requests>=2.31.0
+openai>=1.0.0
+cmdstanpy>=1.2.0
 prophet>=1.1.5
