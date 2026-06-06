@@ -179,6 +179,59 @@ def get_kse100_members() -> list[str]:
 # Technical Indicators
 # ─────────────────────────────────────────────────────────────────────────────
 
+def compute_display_indicators(
+    df: pd.DataFrame,
+    rsi_period: int = 14,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+    bb_period: int = 20,
+    bb_std: float = 2.0,
+    stoch_k: int = 14,
+    stoch_d: int = 3,
+) -> pd.DataFrame:
+    """Recompute indicators with user-supplied parameters (display only, not for ML)."""
+    df = df.copy()
+    c  = df["Close"]
+    h  = df["High"]
+    lo = df["Low"]
+
+    for w in [20, 50, 200]:
+        df[f"SMA_{w}"] = c.rolling(w).mean()
+    df["EMA_12"] = c.ewm(span=macd_fast, adjust=False).mean()
+    df["EMA_26"] = c.ewm(span=macd_slow, adjust=False).mean()
+
+    df["BB_Mid"]   = c.rolling(bb_period).mean()
+    _bb_std        = c.rolling(bb_period).std()
+    df["BB_Upper"] = df["BB_Mid"] + bb_std * _bb_std
+    df["BB_Lower"] = df["BB_Mid"] - bb_std * _bb_std
+    df["BB_Width"] = (df["BB_Upper"] - df["BB_Lower"]) / df["BB_Mid"]
+    df["BB_Pct"]   = (c - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"])
+
+    delta       = c.diff()
+    gain        = delta.clip(lower=0).rolling(rsi_period).mean()
+    loss        = (-delta.clip(upper=0)).rolling(rsi_period).mean()
+    df["RSI"]   = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+    df["MACD"]        = df["EMA_12"] - df["EMA_26"]
+    df["MACD_Signal"] = df["MACD"].ewm(span=macd_signal, adjust=False).mean()
+    df["MACD_Hist"]   = df["MACD"] - df["MACD_Signal"]
+
+    tr          = pd.concat([h - lo, (h - c.shift()).abs(), (lo - c.shift()).abs()], axis=1).max(axis=1)
+    df["ATR"]   = tr.rolling(14).mean()
+
+    low_k       = lo.rolling(stoch_k).min()
+    high_k      = h.rolling(stoch_k).max()
+    df["Stoch_K"] = 100 * (c - low_k) / (high_k - low_k).replace(0, np.nan)
+    df["Stoch_D"] = df["Stoch_K"].rolling(stoch_d).mean()
+
+    if "Volume" in df.columns:
+        df["OBV"] = (np.sign(c.diff()) * df["Volume"]).fillna(0).cumsum()
+
+    df["Return"] = c.pct_change() * 100
+    return df
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c = df["Close"]
@@ -463,8 +516,13 @@ TEMPLATE = "plotly_dark"
 MARGIN   = dict(l=0, r=0, t=30, b=0)
 
 
-def candlestick_chart(df: pd.DataFrame, overlays: list[str]) -> go.Figure:
-    has_vol = "Volume" in df.columns and df["Volume"].notna().any()
+def candlestick_chart(
+    df: pd.DataFrame,
+    overlays: list[str],
+    chart_style: str = "Candlestick",
+    show_volume: bool = True,
+) -> go.Figure:
+    has_vol = show_volume and "Volume" in df.columns and df["Volume"].notna().any()
     rows    = [0.72, 0.28] if has_vol else [1.0]
     n_rows  = 2 if has_vol else 1
 
@@ -475,32 +533,56 @@ def candlestick_chart(df: pd.DataFrame, overlays: list[str]) -> go.Figure:
         row_heights=rows,
     )
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df["Date"], open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"],
-        name="OHLC",
-        increasing_line_color=C_BULL,
-        decreasing_line_color=C_BEAR,
-        increasing_fillcolor=C_BULL,
-        decreasing_fillcolor=C_BEAR,
-    ), row=1, col=1)
+    # Main price trace (Candlestick / OHLC / Line)
+    if chart_style == "Candlestick":
+        fig.add_trace(go.Candlestick(
+            x=df["Date"], open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"],
+            name="OHLC",
+            increasing_line_color=C_BULL,
+            decreasing_line_color=C_BEAR,
+            increasing_fillcolor=C_BULL,
+            decreasing_fillcolor=C_BEAR,
+        ), row=1, col=1)
+    elif chart_style == "OHLC":
+        fig.add_trace(go.Ohlc(
+            x=df["Date"], open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"],
+            name="OHLC",
+            increasing_line_color=C_BULL,
+            decreasing_line_color=C_BEAR,
+        ), row=1, col=1)
+    else:  # Line
+        fig.add_trace(go.Scatter(
+            x=df["Date"], y=df["Close"], name="Close",
+            fill="tozeroy", fillcolor="rgba(66,165,245,0.06)",
+            line=dict(color=C_BLUE, width=2),
+        ), row=1, col=1)
 
     col_map = {
-        "SMA_20":   (C_BLUE,   1.4),
-        "SMA_50":   (C_ORANGE, 1.4),
-        "SMA_200":  (C_PURPLE, 1.4),
-        "BB_Upper": ("#90caf9", 1.0),
-        "BB_Mid":   ("#bbdefb", 1.0),
-        "BB_Lower": ("#90caf9", 1.0),
+        "SMA_20":   (C_BLUE,   1.4, "solid"),
+        "SMA_50":   (C_ORANGE, 1.4, "solid"),
+        "SMA_200":  (C_PURPLE, 1.4, "solid"),
+        "EMA_12":   (C_GOLD,   1.2, "dot"),
+        "EMA_26":   (C_PINK,   1.2, "dot"),
+        "BB_Upper": ("#90caf9", 1.0, "dash"),
+        "BB_Mid":   ("#bbdefb", 1.0, "dot"),
+        "BB_Lower": ("#90caf9", 1.0, "dash"),
+    }
+    _overlay_labels = {
+        "SMA_20": "SMA 20", "SMA_50": "SMA 50", "SMA_200": "SMA 200",
+        "EMA_12": "EMA 12", "EMA_26": "EMA 26",
+        "BB_Upper": "BB Upper", "BB_Mid": "BB Mid", "BB_Lower": "BB Lower",
     }
     for ind in overlays:
         if ind not in df.columns:
             continue
-        color, width = col_map.get(ind, ("#aaa", 1.0))
+        color, width, dash = col_map.get(ind, ("#aaa", 1.0, "solid"))
         fig.add_trace(go.Scatter(
-            x=df["Date"], y=df[ind], name=ind,
-            line=dict(color=color, width=width), opacity=0.85,
+            x=df["Date"], y=df[ind],
+            name=_overlay_labels.get(ind, ind),
+            line=dict(color=color, width=width, dash=dash),
+            opacity=0.85,
         ), row=1, col=1)
 
     # Bollinger band fill
@@ -556,46 +638,75 @@ def line_chart(df: pd.DataFrame, overlays: list[str]) -> go.Figure:
     return fig
 
 
-def rsi_chart(df: pd.DataFrame) -> go.Figure:
+def rsi_chart(df: pd.DataFrame, period: int = 14, ob: int = 70, os_: int = 30) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["Date"], y=df["RSI"], name="RSI",
+        x=df["Date"], y=df["RSI"], name=f"RSI ({period})",
         line=dict(color=C_PURPLE, width=1.6),
     ))
-    fig.add_hrect(y0=70, y1=100, fillcolor="rgba(239,83,80,0.08)",  line_width=0)
-    fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(38,166,154,0.08)", line_width=0)
-    fig.add_hline(y=70, line_dash="dash", line_color=C_BEAR,
-                  annotation_text="Overbought 70", annotation_position="top right")
-    fig.add_hline(y=30, line_dash="dash", line_color=C_BULL,
-                  annotation_text="Oversold 30", annotation_position="bottom right")
-    fig.update_layout(height=230, template=TEMPLATE, margin=MARGIN,
+    fig.add_hrect(y0=ob,  y1=100, fillcolor="rgba(239,83,80,0.08)",  line_width=0)
+    fig.add_hrect(y0=0,   y1=os_, fillcolor="rgba(38,166,154,0.08)", line_width=0)
+    fig.add_hline(y=ob, line_dash="dash", line_color=C_BEAR,
+                  annotation_text=f"Overbought {ob}", annotation_position="top right")
+    fig.add_hline(y=os_, line_dash="dash", line_color=C_BULL,
+                  annotation_text=f"Oversold {os_}", annotation_position="bottom right")
+    fig.update_layout(height=240, template=TEMPLATE, margin=MARGIN,
                       yaxis=dict(range=[0, 100]))
     return fig
 
 
-def macd_chart(df: pd.DataFrame) -> go.Figure:
+def macd_chart(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> go.Figure:
     hist_colors = [C_BULL if v >= 0 else C_BEAR for v in df["MACD_Hist"].fillna(0)]
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df["Date"], y=df["MACD_Hist"],
                          marker_color=hist_colors, name="Histogram", opacity=0.7))
     fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD"],
-                             name="MACD", line=dict(color=C_BLUE, width=1.4)))
+                             name=f"MACD ({fast},{slow})", line=dict(color=C_BLUE, width=1.4)))
     fig.add_trace(go.Scatter(x=df["Date"], y=df["MACD_Signal"],
-                             name="Signal", line=dict(color=C_ORANGE, width=1.4)))
-    fig.update_layout(height=230, template=TEMPLATE, margin=MARGIN)
+                             name=f"Signal ({signal})", line=dict(color=C_ORANGE, width=1.4)))
+    fig.add_hline(y=0, line_color="#555", line_width=0.8)
+    fig.update_layout(height=240, template=TEMPLATE, margin=MARGIN)
     return fig
 
 
-def stoch_chart(df: pd.DataFrame) -> go.Figure:
+def stoch_chart(df: pd.DataFrame, k: int = 14, d: int = 3, ob: int = 80, os_: int = 20) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df["Date"], y=df["Stoch_K"],
-                             name="%K", line=dict(color=C_BLUE, width=1.4)))
+                             name=f"%K ({k})", line=dict(color=C_BLUE, width=1.4)))
     fig.add_trace(go.Scatter(x=df["Date"], y=df["Stoch_D"],
-                             name="%D", line=dict(color=C_ORANGE, width=1.4)))
-    fig.add_hline(y=80, line_dash="dash", line_color=C_BEAR)
-    fig.add_hline(y=20, line_dash="dash", line_color=C_BULL)
-    fig.update_layout(height=230, template=TEMPLATE, margin=MARGIN,
+                             name=f"%D ({d})", line=dict(color=C_ORANGE, width=1.4)))
+    fig.add_hrect(y0=ob,  y1=100, fillcolor="rgba(239,83,80,0.06)",  line_width=0)
+    fig.add_hrect(y0=0,   y1=os_, fillcolor="rgba(38,166,154,0.06)", line_width=0)
+    fig.add_hline(y=ob,  line_dash="dash", line_color=C_BEAR,
+                  annotation_text=f"Overbought {ob}")
+    fig.add_hline(y=os_, line_dash="dash", line_color=C_BULL,
+                  annotation_text=f"Oversold {os_}")
+    fig.update_layout(height=240, template=TEMPLATE, margin=MARGIN,
                       yaxis=dict(range=[0, 100]))
+    return fig
+
+
+def atr_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["Date"], y=df["ATR"], name="ATR",
+        fill="tozeroy", fillcolor="rgba(255,167,38,0.10)",
+        line=dict(color=C_ORANGE, width=1.5),
+    ))
+    fig.update_layout(height=220, template=TEMPLATE, margin=MARGIN,
+                      yaxis_title="ATR (PKR)")
+    return fig
+
+
+def obv_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    colors = [C_BULL if v >= 0 else C_BEAR for v in df["OBV"].diff().fillna(0)]
+    fig.add_trace(go.Bar(
+        x=df["Date"], y=df["OBV"],
+        marker_color=colors, name="OBV", opacity=0.75,
+    ))
+    fig.update_layout(height=220, template=TEMPLATE, margin=MARGIN,
+                      yaxis_title="OBV")
     return fig
 
 
@@ -721,15 +832,6 @@ def main() -> None:
                 max_value=date.today(),
             )
 
-        chart_type = st.radio("Chart Style", ["Candlestick", "Line"], horizontal=True)
-
-        st.divider()
-        st.subheader("📐 Overlays")
-        show_sma20  = st.checkbox("SMA 20",           value=True)
-        show_sma50  = st.checkbox("SMA 50",           value=True)
-        show_sma200 = st.checkbox("SMA 200",          value=False)
-        show_bb     = st.checkbox("Bollinger Bands",  value=False)
-
         st.divider()
         st.subheader("🔮 Prediction")
 
@@ -815,16 +917,41 @@ def main() -> None:
 
     # ── Tab: Price Chart ───────────────────────────────────────────────────────
     with tab_price:
-        overlays = []
-        if show_sma20:  overlays.append("SMA_20")
-        if show_sma50:  overlays.append("SMA_50")
-        if show_sma200: overlays.append("SMA_200")
-        if show_bb:     overlays += ["BB_Upper", "BB_Mid", "BB_Lower"]
+        # In-tab chart toolbar
+        pc1, pc2, pc3 = st.columns([2, 6, 2])
+        with pc1:
+            chart_style = st.radio(
+                "Chart style",
+                ["Candlestick", "OHLC", "Line"],
+                horizontal=True,
+                key="pc_style",
+            )
+        with pc2:
+            selected_overlays = st.multiselect(
+                "Overlays",
+                ["SMA 20", "SMA 50", "SMA 200", "EMA 12", "EMA 26", "Bollinger Bands"],
+                default=["SMA 20", "SMA 50"],
+                key="pc_overlays",
+            )
+        with pc3:
+            show_vol = st.checkbox("Volume", value=True, key="pc_volume")
 
-        if chart_type == "Candlestick":
-            st.plotly_chart(candlestick_chart(df, overlays), use_container_width=True)
-        else:
-            st.plotly_chart(line_chart(df, overlays), use_container_width=True)
+        _overlay_map = {
+            "SMA 20":          ["SMA_20"],
+            "SMA 50":          ["SMA_50"],
+            "SMA 200":         ["SMA_200"],
+            "EMA 12":          ["EMA_12"],
+            "EMA 26":          ["EMA_26"],
+            "Bollinger Bands": ["BB_Upper", "BB_Mid", "BB_Lower"],
+        }
+        overlays: list[str] = []
+        for _o in selected_overlays:
+            overlays.extend(_overlay_map.get(_o, []))
+
+        st.plotly_chart(
+            candlestick_chart(df, overlays, chart_style=chart_style, show_volume=show_vol),
+            use_container_width=True,
+        )
 
         st.divider()
         col_s, col_r = st.columns(2)
@@ -861,40 +988,79 @@ def main() -> None:
 
     # ── Tab: Technical Analysis ────────────────────────────────────────────────
     with tab_tech:
-        # Signal summary banner
-        close_now = df["Close"].iloc[-1]
+
+        # ── Indicator Settings ─────────────────────────────────────────────────
+        with st.expander("⚙️ Indicator Settings", expanded=False):
+            _s1, _s2, _s3, _s4 = st.columns(4)
+            with _s1:
+                st.markdown("**RSI**")
+                rsi_period  = st.slider("Period##rsi",       7,  50,  14, key="rsi_period")
+                rsi_ob      = st.slider("Overbought",        60, 90,  70, key="rsi_ob")
+                rsi_os      = st.slider("Oversold",          10, 40,  30, key="rsi_os")
+            with _s2:
+                st.markdown("**Bollinger Bands**")
+                bb_period   = st.slider("Period##bb",        10, 50,  20, key="bb_period")
+                bb_std_mult = st.slider("Std Dev",           1.0, 3.5, 2.0, 0.5, key="bb_std")
+            with _s3:
+                st.markdown("**MACD**")
+                macd_fast   = st.slider("Fast EMA",          5,  20,  12, key="macd_fast")
+                macd_slow   = st.slider("Slow EMA",          15, 60,  26, key="macd_slow")
+                macd_sig    = st.slider("Signal",            3,  15,   9, key="macd_sig")
+            with _s4:
+                st.markdown("**Stochastic**")
+                stoch_k_p   = st.slider("%K Period",         5,  30,  14, key="stoch_k")
+                stoch_d_p   = st.slider("%D Smooth",         1,  10,   3, key="stoch_d")
+                stoch_ob    = st.slider("Overbought##st",    60, 90,  80, key="stoch_ob")
+                stoch_os    = st.slider("Oversold##st",      10, 40,  20, key="stoch_os")
+
+        show_indicators = st.multiselect(
+            "Indicators to display",
+            ["RSI", "MACD", "Stochastic", "Bollinger Bands", "ATR", "OBV"],
+            default=["RSI", "MACD", "Stochastic", "Bollinger Bands"],
+            key="tech_show_ind",
+        )
+
+        # Recompute with custom params for display (ML always uses fixed params)
+        df_disp = compute_display_indicators(
+            df_raw, rsi_period, macd_fast, macd_slow, macd_sig,
+            bb_period, bb_std_mult, stoch_k_p, stoch_d_p,
+        )
+
+        # ── Signal summary banner ──────────────────────────────────────────────
+        close_now = df_disp["Close"].iloc[-1]
         signals   = {}
 
         for label, col in [("SMA 20", "SMA_20"), ("SMA 50", "SMA_50"), ("SMA 200", "SMA_200")]:
-            if col in df.columns and not np.isnan(df[col].iloc[-1]):
+            if col in df_disp.columns and not np.isnan(df_disp[col].iloc[-1]):
                 signals[f"Price vs {label}"] = (
-                    "🟢 Above" if close_now > df[col].iloc[-1] else "🔴 Below"
+                    "🟢 Above" if close_now > df_disp[col].iloc[-1] else "🔴 Below"
                 )
 
-        if "RSI" in df.columns:
-            r = df["RSI"].iloc[-1]
-            signals["RSI (14)"] = (
-                f"🔴 Overbought ({r:.1f})" if r > 70
-                else f"🟢 Oversold ({r:.1f})" if r < 30
+        if "RSI" in df_disp.columns:
+            r = df_disp["RSI"].iloc[-1]
+            signals[f"RSI ({rsi_period})"] = (
+                f"🔴 Overbought ({r:.1f})" if r > rsi_ob
+                else f"🟢 Oversold ({r:.1f})" if r < rsi_os
                 else f"⚪ Neutral ({r:.1f})"
             )
 
-        if "MACD" in df.columns:
-            macd_now = df["MACD"].iloc[-1]
-            sig_now  = df["MACD_Signal"].iloc[-1]
-            signals["MACD"] = "🟢 Bullish" if macd_now > sig_now else "🔴 Bearish"
+        if "MACD" in df_disp.columns:
+            signals[f"MACD ({macd_fast},{macd_slow})"] = (
+                "🟢 Bullish" if df_disp["MACD"].iloc[-1] > df_disp["MACD_Signal"].iloc[-1]
+                else "🔴 Bearish"
+            )
 
-        if "Stoch_K" in df.columns:
-            sk = df["Stoch_K"].iloc[-1]
-            signals["Stochastic"] = (
-                f"🔴 Overbought ({sk:.1f})" if sk > 80
-                else f"🟢 Oversold ({sk:.1f})" if sk < 20
+        if "Stoch_K" in df_disp.columns:
+            sk = df_disp["Stoch_K"].iloc[-1]
+            signals[f"Stochastic ({stoch_k_p},{stoch_d_p})"] = (
+                f"🔴 Overbought ({sk:.1f})" if sk > stoch_ob
+                else f"🟢 Oversold ({sk:.1f})" if sk < stoch_os
                 else f"⚪ Neutral ({sk:.1f})"
             )
 
-        bulls  = sum(1 for v in signals.values() if "🟢" in v)
-        bears  = sum(1 for v in signals.values() if "🔴" in v)
-        total  = len(signals)
+        bulls   = sum(1 for v in signals.values() if "🟢" in v)
+        bears   = sum(1 for v in signals.values() if "🔴" in v)
+        total   = len(signals)
         verdict = ("🟢 Bullish Bias" if bulls > bears else
                    "🔴 Bearish Bias" if bears > bulls else "⚪ Mixed / Neutral")
 
@@ -911,42 +1077,59 @@ def main() -> None:
 
         st.divider()
 
-        # Individual indicator charts
-        st.subheader("RSI — Relative Strength Index (14)")
-        if "RSI" in df.columns:
-            st.plotly_chart(rsi_chart(df), use_container_width=True)
+        # ── Togglable indicator charts ─────────────────────────────────────────
+        if "RSI" in show_indicators and "RSI" in df_disp.columns:
+            st.subheader(f"RSI — Relative Strength Index ({rsi_period})")
+            st.plotly_chart(
+                rsi_chart(df_disp, period=rsi_period, ob=rsi_ob, os_=rsi_os),
+                use_container_width=True,
+            )
 
-        st.subheader("MACD (12, 26, 9)")
-        if "MACD" in df.columns:
-            st.plotly_chart(macd_chart(df), use_container_width=True)
+        if "MACD" in show_indicators and "MACD" in df_disp.columns:
+            st.subheader(f"MACD ({macd_fast}, {macd_slow}, {macd_sig})")
+            st.plotly_chart(
+                macd_chart(df_disp, fast=macd_fast, slow=macd_slow, signal=macd_sig),
+                use_container_width=True,
+            )
 
-        st.subheader("Stochastic Oscillator (14, 3)")
-        if "Stoch_K" in df.columns:
-            st.plotly_chart(stoch_chart(df), use_container_width=True)
+        if "Stochastic" in show_indicators and "Stoch_K" in df_disp.columns:
+            st.subheader(f"Stochastic Oscillator ({stoch_k_p}, {stoch_d_p})")
+            st.plotly_chart(
+                stoch_chart(df_disp, k=stoch_k_p, d=stoch_d_p, ob=stoch_ob, os_=stoch_os),
+                use_container_width=True,
+            )
 
-        st.subheader("Bollinger Bands (20, ±2σ)")
-        if "BB_Upper" in df.columns:
+        if "Bollinger Bands" in show_indicators and "BB_Upper" in df_disp.columns:
+            st.subheader(f"Bollinger Bands ({bb_period}, ±{bb_std_mult}σ)")
             fig_bb = go.Figure()
             fig_bb.add_trace(go.Scatter(
-                x=df["Date"], y=df["BB_Upper"], name="Upper",
+                x=df_disp["Date"], y=df_disp["BB_Upper"], name="Upper",
                 line=dict(color=C_BEAR, width=1, dash="dot"),
             ))
             fig_bb.add_trace(go.Scatter(
-                x=df["Date"], y=df["BB_Mid"], name="Mid (SMA 20)",
+                x=df_disp["Date"], y=df_disp["BB_Mid"],
+                name=f"Mid (SMA {bb_period})",
                 line=dict(color="#888", width=1),
             ))
             fig_bb.add_trace(go.Scatter(
-                x=df["Date"], y=df["BB_Lower"], name="Lower",
+                x=df_disp["Date"], y=df_disp["BB_Lower"], name="Lower",
                 line=dict(color=C_BULL, width=1, dash="dot"),
-                fill="tonexty",
-                fillcolor="rgba(33,150,243,0.05)",
+                fill="tonexty", fillcolor="rgba(33,150,243,0.05)",
             ))
             fig_bb.add_trace(go.Scatter(
-                x=df["Date"], y=df["Close"], name="Close",
+                x=df_disp["Date"], y=df_disp["Close"], name="Close",
                 line=dict(color=C_BLUE, width=1.6),
             ))
-            fig_bb.update_layout(height=280, template=TEMPLATE, margin=MARGIN)
+            fig_bb.update_layout(height=300, template=TEMPLATE, margin=MARGIN)
             st.plotly_chart(fig_bb, use_container_width=True)
+
+        if "ATR" in show_indicators and "ATR" in df_disp.columns:
+            st.subheader("ATR — Average True Range (14)")
+            st.plotly_chart(atr_chart(df_disp), use_container_width=True)
+
+        if "OBV" in show_indicators and "OBV" in df_disp.columns:
+            st.subheader("OBV — On-Balance Volume")
+            st.plotly_chart(obv_chart(df_disp), use_container_width=True)
 
     # ── Tab: AI Insights ──────────────────────────────────────────────────────
     with tab_ai:
