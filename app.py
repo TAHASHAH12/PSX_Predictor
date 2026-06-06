@@ -33,6 +33,7 @@ except ImportError:
 
 import sentiment as sent_mod   # Alpha Vantage + GPT-4o
 import dawn_scraper as dawn_mod  # Dawn.com scraper + BERT
+import fear_greed as fg_mod      # PSX Fear & Greed Index
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -833,6 +834,32 @@ def main() -> None:
             )
 
         st.divider()
+        st.subheader("😱 Fear & Greed")
+        _fg = fg_mod.fetch_current()
+        if _fg:
+            _score     = float(_fg.get("composite_score", 0))
+            _label     = _fg.get("fear_greed_label", fg_mod.score_to_label(_score))
+            _delta_p   = _fg.get("deltaSincePrevious", _fg.get("delta", 0)) or 0
+            _delta_24h = _fg.get("deltaSinceYesterday", 0) or 0
+            _age       = _fg.get("ageMinutes")
+            _color     = fg_mod.label_color(_label)
+            _emoji     = fg_mod.label_emoji(_label)
+            st.markdown(
+                f"<div style='text-align:center; padding:6px 0'>"
+                f"<span style='font-size:2.4rem; font-weight:700; color:{_color}'>{int(round(_score))}</span>"
+                f"<br><span style='color:{_color}; font-weight:600'>{_emoji} {_label}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            _fa, _fb = st.columns(2)
+            _fa.metric("vs Previous", f"{_delta_p:+.1f}")
+            _fb.metric("vs 24h Ago",  f"{_delta_24h:+.1f}")
+            if _age is not None:
+                st.caption(f"Updated {fg_mod._age_str(_age)}")
+        else:
+            st.caption("Fear & Greed unavailable")
+
+        st.divider()
         st.subheader("🔮 Prediction")
 
         model_options = (
@@ -1141,6 +1168,175 @@ def main() -> None:
             "</div>",
             unsafe_allow_html=True,
         )
+
+        # ── PSX Fear & Greed Index (no API key needed) ─────────────────────────
+        st.subheader("PSX Fear & Greed Index")
+        st.caption(
+            "Real-time sentiment indicator for the Pakistan Stock Exchange "
+            "· Source: [psx-fear-greed.com](https://www.psx-fear-greed.com) "
+            "· Updates every 15 min"
+        )
+
+        with st.spinner("Fetching PSX Fear & Greed data…"):
+            fg_current = fg_mod.fetch_current()
+            fg_history = fg_mod.fetch_history()
+
+        if fg_current:
+            fg_score     = float(fg_current.get("composite_score", 0))
+            fg_label     = fg_current.get("fear_greed_label", fg_mod.score_to_label(fg_score))
+            fg_delta_p   = float(fg_current.get("deltaSincePrevious", fg_current.get("delta", 0)) or 0)
+            fg_delta_24h = float(fg_current.get("deltaSinceYesterday", 0) or 0)
+            fg_prev      = float(fg_current.get("previousScore", fg_score - fg_delta_p))
+            fg_age       = fg_current.get("ageMinutes")
+            fg_direction = fg_current.get("direction", "")
+            fg_color     = fg_mod.label_color(fg_label)
+            fg_emoji     = fg_mod.label_emoji(fg_label)
+            fg_dir_arrow = "▲" if fg_direction == "up" else ("▼" if fg_direction == "down" else "")
+
+            # Metrics row
+            fg_c1, fg_c2, fg_c3, fg_c4, fg_c5 = st.columns(5)
+            fg_c1.metric("Current Score",    f"{fg_score:.1f}",
+                         f"{fg_dir_arrow} {fg_delta_p:+.1f} vs last")
+            fg_c2.metric("Sentiment",        f"{fg_emoji} {fg_label}")
+            fg_c3.metric("Previous Reading", f"{fg_prev:.1f}")
+            fg_c4.metric("vs 24h Ago",       f"{fg_delta_24h:+.1f}")
+            fg_c5.metric("Updated",          fg_mod._age_str(fg_age))
+
+            # Gauge + component breakdown side by side
+            fg_col_gauge, fg_col_comp = st.columns([2, 3])
+
+            with fg_col_gauge:
+                fg_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=fg_score,
+                    number={"font": {"size": 48, "color": fg_color}, "suffix": ""},
+                    title={"text": f"{fg_emoji} {fg_label}", "font": {"size": 16, "color": fg_color}},
+                    gauge={
+                        "axis": {
+                            "range": [0, 100],
+                            "tickvals": [0, 25, 45, 55, 75, 100],
+                            "ticktext": ["0", "25", "45", "55", "75", "100"],
+                            "tickcolor": "#ccc",
+                        },
+                        "bar": {"color": fg_color, "thickness": 0.25},
+                        "bgcolor": "rgba(0,0,0,0)",
+                        "borderwidth": 1,
+                        "bordercolor": "#444",
+                        "steps": [
+                            {"range": [0,  25],  "color": "rgba(198,40,40,0.30)"},
+                            {"range": [25, 45],  "color": "rgba(239,83,80,0.20)"},
+                            {"range": [45, 55],  "color": "rgba(255,213,79,0.18)"},
+                            {"range": [55, 75],  "color": "rgba(102,187,106,0.20)"},
+                            {"range": [75, 100], "color": "rgba(46,125,50,0.30)"},
+                        ],
+                        "threshold": {
+                            "line": {"color": fg_color, "width": 4},
+                            "thickness": 0.75,
+                            "value": fg_score,
+                        },
+                    },
+                ))
+                fg_gauge.update_layout(
+                    height=300, template=TEMPLATE, margin=dict(t=40, b=20, l=20, r=20),
+                )
+                st.plotly_chart(fg_gauge, use_container_width=True)
+                st.markdown(
+                    "<div style='text-align:center; margin-top:-12px'>"
+                    "<span style='color:#c62828; font-size:0.75rem'>Extreme Fear</span>"
+                    "&nbsp;·&nbsp;"
+                    "<span style='color:#ef5350; font-size:0.75rem'>Fear</span>"
+                    "&nbsp;·&nbsp;"
+                    "<span style='color:#ffd54f; font-size:0.75rem'>Neutral</span>"
+                    "&nbsp;·&nbsp;"
+                    "<span style='color:#66bb6a; font-size:0.75rem'>Greed</span>"
+                    "&nbsp;·&nbsp;"
+                    "<span style='color:#2e7d32; font-size:0.75rem'>Extreme Greed</span>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with fg_col_comp:
+                fg_comp_df = fg_mod.components_dataframe(fg_current)
+                if not fg_comp_df.empty:
+                    st.markdown("**Component Breakdown**")
+                    # Horizontal bar chart coloured by zone
+                    bar_colors = [fg_mod.label_color(fg_mod.score_to_label(s))
+                                  for s in fg_comp_df["Score"]]
+                    fig_comp = go.Figure()
+                    fig_comp.add_trace(go.Bar(
+                        y=fg_comp_df["Component"],
+                        x=fg_comp_df["Score"],
+                        orientation="h",
+                        marker_color=bar_colors,
+                        text=[
+                            f"{s:.0f} ({w*100:.0f}% wt)"
+                            for s, w in zip(fg_comp_df["Score"], fg_comp_df["Weight"])
+                        ],
+                        textposition="auto",
+                        name="Score",
+                    ))
+                    fig_comp.add_vline(x=50, line_dash="dash", line_color="#555", line_width=1)
+                    fig_comp.add_vline(x=fg_score, line_dash="dot", line_color=fg_color,
+                                       line_width=2,
+                                       annotation_text=f"Overall: {fg_score:.1f}",
+                                       annotation_position="top right")
+                    fig_comp.update_layout(
+                        height=300, template=TEMPLATE,
+                        margin=dict(t=10, b=10, l=10, r=10),
+                        xaxis=dict(range=[0, 100], title="Score (0 = Extreme Fear, 100 = Extreme Greed)"),
+                        yaxis=dict(title=""),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_comp, use_container_width=True)
+
+            # Historical trend chart
+            if fg_history:
+                fg_hist_df = fg_mod.history_dataframe(fg_history)
+                st.markdown("**Historical Trend**")
+                fig_hist = go.Figure()
+
+                # Colour-coded scatter
+                hist_colors = [
+                    fg_mod.label_color(fg_mod.score_to_label(s))
+                    for s in fg_hist_df["composite_score"]
+                ]
+                fig_hist.add_trace(go.Scatter(
+                    x=fg_hist_df["timestamp"],
+                    y=fg_hist_df["composite_score"],
+                    mode="lines+markers",
+                    name="F&G Score",
+                    line=dict(color="#90caf9", width=1.5),
+                    marker=dict(color=hist_colors, size=6, line=dict(width=0)),
+                    hovertemplate=(
+                        "<b>%{x|%d %b %Y %H:%M}</b><br>"
+                        "Score: %{y:.1f}<extra></extra>"
+                    ),
+                ))
+
+                # Zone bands
+                for lo, hi, lbl, _, band_color in fg_mod._ZONES:
+                    fig_hist.add_hrect(
+                        y0=lo, y1=hi,
+                        fillcolor=band_color, line_width=0,
+                        annotation_text=lbl,
+                        annotation_position="right",
+                        annotation_font_size=10,
+                    )
+
+                fig_hist.add_hline(y=50, line_dash="dash", line_color="#555", line_width=1)
+                fig_hist.update_layout(
+                    height=320, template=TEMPLATE,
+                    margin=MARGIN,
+                    yaxis=dict(range=[0, 100], title="Fear & Greed Score"),
+                    xaxis_title="",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01),
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+        else:
+            st.warning("Could not fetch PSX Fear & Greed data. The API may be temporarily unavailable.")
+
+        st.divider()
 
         if not av_key or not openai_key:
             st.info(
