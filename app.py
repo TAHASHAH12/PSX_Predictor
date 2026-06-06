@@ -31,7 +31,8 @@ try:
 except ImportError:
     PROPHET_AVAILABLE = False
 
-import sentiment as sent_mod   # our sentiment.py module
+import sentiment as sent_mod   # Alpha Vantage + GPT-4o
+import dawn_scraper as dawn_mod  # Dawn.com scraper + BERT
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -238,6 +239,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def build_features(
     df: pd.DataFrame,
     sentiment_series: pd.Series | None = None,
+    dawn_sentiment_series: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     df = add_indicators(df).copy()
     c  = df["Close"]
@@ -270,16 +272,30 @@ def build_features(
     if "Volume" in df.columns:
         feat["vol_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
 
-    # ── Sentiment feature (Alpha Vantage, aligned to price dates) ────────────
-    if sentiment_series is not None and len(sentiment_series) > 0:
+    # ── Sentiment features ────────────────────────────────────────────────────
+    # Combine Alpha Vantage (global sector) + Dawn/BERT (Pakistan-specific)
+    combined = dawn_mod.combine_sentiment_series(sentiment_series, dawn_sentiment_series)
+    active_series = combined if combined is not None else sentiment_series
+
+    if active_series is not None and len(active_series) > 0:
         if "Date" in df.columns:
-            aligned = sentiment_series.reindex(df["Date"].values).ffill().bfill().fillna(0.0)
+            aligned = active_series.reindex(df["Date"].values).ffill().bfill().fillna(0.0)
             aligned.index = df.index
         else:
-            aligned = sentiment_series.reindex(df.index).ffill().bfill().fillna(0.0)
+            aligned = active_series.reindex(df.index).ffill().bfill().fillna(0.0)
         feat["sentiment"]      = aligned.values
         feat["sentiment_ma5"]  = aligned.rolling(5, min_periods=1).mean().values
         feat["sentiment_ma20"] = aligned.rolling(20, min_periods=1).mean().values
+
+    # Dawn-specific feature (standalone, even when AV not available)
+    if dawn_sentiment_series is not None and len(dawn_sentiment_series) > 0:
+        if "Date" in df.columns:
+            d_aligned = dawn_sentiment_series.reindex(df["Date"].values).ffill().bfill().fillna(0.0)
+            d_aligned.index = df.index
+        else:
+            d_aligned = dawn_sentiment_series.reindex(df.index).ffill().bfill().fillna(0.0)
+        feat["dawn_sent"]     = d_aligned.values
+        feat["dawn_sent_ma5"] = d_aligned.rolling(5, min_periods=1).mean().values
 
     feat["target"] = c
     feat = feat.dropna()
@@ -298,8 +314,10 @@ def run_ml_forecast(
     model_name: str,
     horizon: int,
     sentiment_series: pd.Series | None = None,
+    dawn_sentiment_series: pd.Series | None = None,
 ) -> dict:
-    X, y = build_features(df, sentiment_series=sentiment_series)
+    X, y = build_features(df, sentiment_series=sentiment_series,
+                          dawn_sentiment_series=dawn_sentiment_series)
 
     if len(X) < 80:
         return {"error": "Need at least 80 trading days of data."}
@@ -726,9 +744,14 @@ def main() -> None:
         pred_model   = st.selectbox("Model", model_options)
         horizon      = st.slider("Forecast Days", 7, 90, 30, 7)
         use_sentiment_feature = st.checkbox(
-            "Include sentiment in ML features",
+            "Alpha Vantage sentiment (ML feature)",
             value=True,
-            help="Adds Alpha Vantage sentiment score as a feature to the ML models",
+            help="Adds Alpha Vantage sector sentiment as a feature to the ML models",
+        )
+        use_dawn_sentiment = st.checkbox(
+            "Dawn.com BERT sentiment (ML feature)",
+            value=True,
+            help="Scrapes Dawn.com Pakistan business news and runs BERT locally. No API key needed.",
         )
         run_pred_btn = st.button("▶ Run Forecast", type="primary", use_container_width=True)
 
@@ -1057,6 +1080,110 @@ def main() -> None:
 
             st.divider()
 
+            # ── 3b. Dawn.com BERT section ──────────────────────────────────────
+            st.subheader("Dawn.com Pakistan Business News — BERT Sentiment")
+            st.caption(
+                "Scraped from [dawn.com/business/business-finance](https://www.dawn.com/business/business-finance) "
+                "· Analysed locally with **nlptown/bert-base-multilingual-uncased-sentiment** · No API key required"
+            )
+
+            with st.spinner("Loading BERT model and scraping Dawn.com…"):
+                try:
+                    dawn_articles_raw = dawn_mod.scrape_dawn_articles(max_pages=3)
+                    dawn_articles     = dawn_mod.analyze_dawn_articles(dawn_articles_raw, psx_only=False)
+                    dawn_agg          = dawn_mod.aggregate_dawn_sentiment(dawn_articles, days_back=14)
+                    dawn_ok = True
+                except Exception as _e:
+                    st.warning(f"Dawn.com / BERT error: {_e}")
+                    dawn_articles = []
+                    dawn_agg      = {"score": 0.0, "label": "Neutral", "article_count": 0,
+                                     "bullish_pct": 0.0, "bearish_pct": 0.0,
+                                     "top_headlines": [], "label_counts": {}}
+                    dawn_ok = False
+
+            if dawn_ok:
+                d_score_color = (
+                    C_BULL if dawn_agg["score"] > 0.08
+                    else C_BEAR if dawn_agg["score"] < -0.08
+                    else "#aaa"
+                )
+                da1, da2, da3, da4 = st.columns(4)
+                da1.metric("BERT Score",         f"{dawn_agg['score']:+.4f}", dawn_agg["label"])
+                da2.metric("Positive Articles", f"{dawn_agg['bullish_pct']:.1f}%")
+                da3.metric("Negative Articles", f"{dawn_agg['bearish_pct']:.1f}%")
+                da4.metric("Articles Scraped",  dawn_agg["article_count"])
+
+                # BERT sentiment gauge
+                dawn_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number+delta",
+                    value=dawn_agg["score"],
+                    delta={"reference": 0, "valueformat": ".4f"},
+                    title={"text": "Dawn.com BERT Score", "font": {"size": 14}},
+                    gauge={
+                        "axis":  {"range": [-1, 1], "tickwidth": 1, "tickcolor": "#ccc"},
+                        "bar":   {"color": d_score_color},
+                        "bgcolor": "rgba(0,0,0,0)",
+                        "borderwidth": 1, "bordercolor": "#555",
+                        "steps": [
+                            {"range": [-1.0, -0.25], "color": "rgba(239,83,80,0.25)"},
+                            {"range": [-0.25,-0.08], "color": "rgba(239,83,80,0.10)"},
+                            {"range": [-0.08, 0.08], "color": "rgba(180,180,180,0.08)"},
+                            {"range": [ 0.08, 0.25], "color": "rgba(38,166,154,0.10)"},
+                            {"range": [ 0.25, 1.0],  "color": "rgba(38,166,154,0.25)"},
+                        ],
+                        "threshold": {"line": {"color": "#fff", "width": 2},
+                                      "thickness": 0.75, "value": dawn_agg["score"]},
+                    },
+                    number={"valueformat": ".4f", "font": {"size": 22}},
+                ))
+                dawn_gauge.update_layout(
+                    height=260, template=TEMPLATE,
+                    margin=dict(l=20, r=20, t=40, b=10),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(dawn_gauge, use_container_width=True)
+
+                # Label distribution
+                if dawn_agg.get("label_counts"):
+                    lc2 = dawn_agg["label_counts"]
+                    label_order2  = ["Positive", "Neutral", "Negative"]
+                    label_colors2 = [C_BULL, "#90a4ae", C_BEAR]
+                    bar_x2 = [lc2.get(l, 0) for l in label_order2]
+                    fig_lc2 = go.Figure(go.Bar(
+                        x=bar_x2, y=label_order2, orientation="h",
+                        marker_color=label_colors2, opacity=0.85,
+                        text=[f"{v}" for v in bar_x2], textposition="auto",
+                    ))
+                    fig_lc2.update_layout(
+                        height=180, template=TEMPLATE,
+                        margin=dict(l=0, r=0, t=10, b=0),
+                        xaxis_title="Article Count",
+                    )
+                    st.plotly_chart(fig_lc2, use_container_width=True)
+
+                # PSX-relevant articles table
+                psx_arts = [a for a in dawn_agg["top_headlines"] if a.get("psx_relevant")]
+                all_arts = dawn_agg["top_headlines"]
+                shown    = psx_arts if psx_arts else all_arts
+
+                if shown:
+                    st.caption(
+                        f"Showing {'PSX-relevant' if psx_arts else 'all'} articles "
+                        f"({len(psx_arts)} PSX-relevant out of {len(all_arts)} total)"
+                    )
+                    hdf2 = pd.DataFrame(shown)[["published", "label", "score", "source", "title"]]
+                    hdf2["score"] = hdf2["score"].apply(lambda s: f"{s:+.4f}")
+                    st.dataframe(hdf2, use_container_width=True, hide_index=True, height=300)
+
+                    # Clickable links expander
+                    with st.expander("Article links"):
+                        for h in shown[:15]:
+                            url_h = h.get("url", "")
+                            if url_h:
+                                st.markdown(f"- [{h['title']}]({url_h})")
+
+            st.divider()
+
             # ── 4. GPT-4 Analysis ──────────────────────────────────────────────
             st.subheader("GPT-4o — PSX Analyst Report")
             with st.spinner("Consulting GPT-4o… (this may take 10–20 seconds)"):
@@ -1180,36 +1307,61 @@ def main() -> None:
             st.plotly_chart(fig_prev, use_container_width=True)
 
         else:
-            # ── Fetch sentiment series for ML feature (if key provided) ───────
+            # ── Fetch Alpha Vantage sentiment series (if key provided) ────────
             sent_series = None
             if use_sentiment_feature and av_key:
                 with st.spinner("Fetching Alpha Vantage sentiment for ML features…"):
-                    topics_str = ",".join(sent_mod.topics_for(symbol))
+                    topics_str  = ",".join(sent_mod.topics_for(symbol))
                     av_articles = sent_mod.fetch_av_sentiment(av_key, topics_str, limit=200)
                     if av_articles and "Date" in df.columns:
                         sent_series = sent_mod.build_sentiment_series(
                             av_articles, pd.DatetimeIndex(df["Date"].values)
                         )
                         st.caption(
-                            f"✅ Sentiment feature: {len(av_articles)} articles "
+                            f"✅ Alpha Vantage sentiment: {len(av_articles)} articles "
                             f"→ {sent_series.notna().sum()} aligned trading days"
                         )
+
+            # ── Fetch Dawn.com BERT sentiment series ───────────────────────────
+            dawn_sent_series = None
+            if use_dawn_sentiment:
+                with st.spinner("Scraping Dawn.com + running BERT…"):
+                    try:
+                        dawn_raw_pred  = dawn_mod.scrape_dawn_articles(max_pages=3)
+                        dawn_enriched  = dawn_mod.analyze_dawn_articles(dawn_raw_pred)
+                        if dawn_enriched and "Date" in df.columns:
+                            dawn_sent_series = dawn_mod.build_dawn_sentiment_series(
+                                dawn_enriched, pd.DatetimeIndex(df["Date"].values)
+                            )
+                            n_psx = sum(1 for a in dawn_enriched if a.get("psx_relevant"))
+                            st.caption(
+                                f"✅ Dawn.com BERT: {len(dawn_enriched)} articles "
+                                f"({n_psx} PSX-relevant) → {dawn_sent_series.notna().sum()} aligned days"
+                            )
+                    except Exception as _de:
+                        st.warning(f"Dawn.com/BERT skipped: {_de}")
 
             with st.spinner(f"Running {pred_model} — this may take a moment…"):
                 if pred_model == "Prophet":
                     result = run_prophet_forecast(df_raw, horizon)
                 else:
                     result = run_ml_forecast(df_raw, pred_model, horizon,
-                                             sentiment_series=sent_series)
+                                             sentiment_series=sent_series,
+                                             dawn_sentiment_series=dawn_sent_series)
 
             if "error" in result:
                 st.error(result["error"])
             else:
                 # ── Sentiment-adjusted forecast note ─────────────────────────
+                active_sents = []
                 if sent_series is not None:
+                    active_sents.append("Alpha Vantage (global sector)")
+                if dawn_sent_series is not None:
+                    active_sents.append("Dawn.com BERT (Pakistan news)")
+                if active_sents:
                     st.caption(
-                        "✅ **Sentiment-enhanced model** — Alpha Vantage sentiment score "
-                        "included as ML feature (sentiment, sentiment_ma5, sentiment_ma20)."
+                        f"✅ **Sentiment-enhanced model** — {' + '.join(active_sents)} "
+                        "combined as ML features (sentiment, sentiment_ma5, sentiment_ma20, dawn_sent)."
                     )
 
                 # ── Metrics row ──────────────────────────────────────────────
